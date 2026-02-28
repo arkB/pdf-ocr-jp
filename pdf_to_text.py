@@ -8,6 +8,15 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pdf_to_pages import pdf_to_images, has_embedded_text
 
+# BudouXのインポート
+try:
+    import budoux
+
+    BUDOUX_AVAILABLE = True
+    _budoux_parser = None
+except ImportError:
+    BUDOUX_AVAILABLE = False
+
 # Janomeのインポート（オプション）
 JANOME_AVAILABLE = False
 _janome_tokenizer = None
@@ -111,11 +120,9 @@ def _segment_japanese_line(
     line: str, max_chars: int = DEFAULT_MAX_LINE_LENGTH
 ) -> list[str]:
     """
-    Janomeを使って日本語の文章を文節単位に分割する。
-    読点（、）は文節の区切りとして扱い、句点（。）で段落を区切る。
-    英語が含まれる場合は単語単位で改行する。
-    固有名詞やカタカナ語は分割しない。
-    max_charsを目安に、前後の範囲内で最適な改行位置を探す。
+    BudouXを使って日本語の文章を文節単位に分割する。
+    読点（、）で文節を区切り、句点（。）で段落を区切る。
+    max_charsを目安に、BudouXの文節分割結果を組み合わせて改行位置を決定。
 
     Args:
         line: 分割する文章
@@ -124,10 +131,9 @@ def _segment_japanese_line(
     Returns:
         分割された行のリスト
     """
-    global _janome_tokenizer
+    global _budoux_parser
 
     # 許容範囲内の文字数ならそのまま返す
-    min_chars = int(max_chars * 0.75)  # 最小75%
     max_limit = int(max_chars * 1.2)  # 最大120%
 
     if len(line) <= max_limit:
@@ -137,51 +143,56 @@ def _segment_japanese_line(
     if all(c.isascii() or c.isspace() or c in ".,!?-:;/" for c in line):
         return _segment_english_line(line, max_chars)
 
-    # 日本語が含まれていない、またはJanomeが利用不可ならそのまま返す
-    if not JANOME_AVAILABLE:
+    # BudouXが利用不可ならそのまま返す
+    if not BUDOUX_AVAILABLE:
         return [line]
 
-    # Janomeトークナイザーを初期化（初回のみ）
-    if _janome_tokenizer is None:
-        _janome_tokenizer = JanomeTokenizer()
+    # BudouXパーサーを初期化（初回のみ）
+    if _budoux_parser is None:
+        _budoux_parser = budoux.load_default_japanese_parser()
 
-    tokenizer = _janome_tokenizer
-    tokens = list(tokenizer.tokenize(line))
+    parser = _budoux_parser
 
-    # 固有名詞とカタカナ語を結合
-    tokens = _merge_proper_nouns(tokens)
+    # BudouXで文節に分割
+    chunks = parser.parse(line)
 
     result = []
     current_line = ""
     current_length = 0
 
-    for i, token in enumerate(tokens):
-        word = token.surface
-        pos = token.part_of_speech.split(",")[0]
-        word_len = len(word)
+    for chunk in chunks:
+        chunk_len = len(chunk)
 
-        # 句点（。）の場合は現在の行を確定して新しい段落を開始
-        if word == "。":
-            current_line += word
-            if current_line.strip():
-                result.append(current_line)
+        # 読点（、）で終わるチャンクで、目標文字数を超えた場合は改行
+        if (
+            chunk.endswith("。")
+            and current_length + chunk_len >= max_chars
+            and current_line
+        ):
+            current_line += chunk
+            result.append(current_line)
             current_line = ""
             current_length = 0
             continue
 
         # 最大限界を超えた場合は強制改行
-        if current_length + word_len > max_limit and current_line:
+        if current_length + chunk_len > max_limit and current_line:
             result.append(current_line)
-            current_line = word
-            current_length = word_len
+            current_line = chunk
+            current_length = chunk_len
+            # 句点で終わる場合は確定
+            if current_line.endswith("。"):
+                result.append(current_line)
+                current_line = ""
+                current_length = 0
             continue
 
         # 現在の行に追加
-        current_line += word
-        current_length += word_len
+        current_line += chunk
+        current_length += chunk_len
 
-        # 目標文字数を超えた場合で、良い改行位置（読点で終わる）なら改行
-        if current_length >= max_chars and current_line.endswith("、"):
+        # 句点（。）で終わる場合は段落区切り
+        if current_line.endswith("。"):
             result.append(current_line)
             current_line = ""
             current_length = 0
